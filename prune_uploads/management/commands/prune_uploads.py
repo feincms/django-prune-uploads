@@ -102,10 +102,6 @@ class Command(BaseCommand):
         if not bucket_name:
             raise ValueError("Could not determine S3 bucket name from storage backend")
 
-        self.stdout.write(
-            f"Enumerating S3 bucket: {bucket_name} (prefix: {prefix or '(none)'})"
-        )
-
         files = set()
         paginator = client.get_paginator("list_objects_v2")
         page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
@@ -130,13 +126,21 @@ class Command(BaseCommand):
 
         return files
 
-    def _enumerate_filesystem_files(self):
+    def _enumerate_filesystem_files(self, storage):
         """Enumerate files using os.walk for filesystem storage."""
+        # Get the root directory from the storage
+        if hasattr(storage, "location"):
+            root = storage.location
+        elif hasattr(storage, "base_location"):
+            root = storage.base_location
+        else:
+            root = settings.MEDIA_ROOT
+
+        root = str(root)
+
         existing = set()
         count = 0
-        for dirpath, dirnames, filenames in os.walk(
-            settings.MEDIA_ROOT, followlinks=True
-        ):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
             for idx in range(len(dirnames) - 1, -1, -1):
                 for exclude in EXCLUDE_DIRS:
                     if re.match(exclude, dirnames[idx]):
@@ -147,12 +151,8 @@ class Command(BaseCommand):
             if count % 1000 == 0:
                 self.stdout.write(f"  Found {count} files so far...")
 
-        media_root = str(settings.MEDIA_ROOT)
-        existing = {
-            e[len(media_root) :].lstrip("/")
-            for e in existing
-            if e.startswith(media_root)
-        }
+        # Make paths relative to the storage root
+        existing = {e[len(root) :].lstrip("/") for e in existing if e.startswith(root)}
         return existing
 
     def _delete_file(self, storage, filename):
@@ -229,6 +229,7 @@ class Command(BaseCommand):
         )
         self.stdout.write()
 
+        # Collect known files and track their source (model, field, pk)
         known_with_source = {}
 
         for model, fields in filefields.items():
@@ -237,24 +238,63 @@ class Command(BaseCommand):
             ):
                 for idx, name in enumerate(row[1:]):
                     if name:
-                        known_with_source[name] = (model, fields[idx], row[0])
+                        field = fields[idx]
+                        known_with_source[name] = (model, field, row[0])
 
         known = set(known_with_source.keys())
+
+        # Collect all unique storage backends and derive known files per storage
+        storages = set()
+        for model, fields in filefields.items():
+            for field in fields:
+                storages.add(field.storage)
+
+        # If no fields have custom storage, use default_storage
+        if not storages:
+            storages.add(default_storage)
+
+        # Build known_by_storage from known_with_source
+        known_by_storage = {storage: set() for storage in storages}
+        for name, (model, field, pk) in known_with_source.items():
+            known_by_storage[field.storage].add(name)
 
         self.stdout.write("\n")
         self.stdout.write("#" * 79)
         self.stdout.write("Known media files: %d" % len(known))
 
-        # Detect storage backend and enumerate files accordingly
-        storage = default_storage
-        if self._is_s3_storage(storage):
-            self.stdout.write(
-                "Detected S3 storage backend, using boto3 for enumeration"
-            )
-            existing = self._enumerate_s3_files(storage)
-        else:
-            self.stdout.write("Using filesystem storage")
-            existing = self._enumerate_filesystem_files()
+        self.stdout.write("Found %d storage backend(s)" % len(storages))
+
+        # Enumerate files from all storage backends
+        # Track which files belong to which storage (files can exist in multiple storages)
+        existing_by_storage = {}
+        for idx, storage in enumerate(storages, 1):
+            if self._is_s3_storage(storage):
+                bucket_name, prefix = self._get_s3_bucket_and_prefix(storage)
+                self.stdout.write(
+                    f"Storage {idx}/{len(storages)}: S3 ({storage.__class__.__name__}) "
+                    f"bucket={bucket_name} prefix={prefix or '(none)'}"
+                )
+                files = self._enumerate_s3_files(storage)
+            else:
+                root = str(
+                    getattr(
+                        storage,
+                        "location",
+                        getattr(storage, "base_location", settings.MEDIA_ROOT),
+                    )
+                )
+                self.stdout.write(
+                    f"Storage {idx}/{len(storages)}: Filesystem ({storage.__class__.__name__}) "
+                    f"location={root}"
+                )
+                files = self._enumerate_filesystem_files(storage)
+
+            existing_by_storage[storage] = files
+
+        # Combine all files for comparison with known files
+        existing = set()
+        for files in existing_by_storage.values():
+            existing |= files
 
         self.stdout.write("Found media files: %d" % len(existing))
 
@@ -305,12 +345,30 @@ class Command(BaseCommand):
 
         self.stdout.write("\n")
         self.stdout.write("#" * 79)
-        self.stdout.write("Media files not in DB: %d" % (len(existing - known)))
+
+        # Calculate orphans per storage backend
+        total_orphans = 0
+        orphans_by_storage = {}
+        for storage, files in existing_by_storage.items():
+            storage_known = known_by_storage.get(storage, set())
+            orphans = files - storage_known
+            orphans_by_storage[storage] = orphans
+            total_orphans += len(orphans)
+
+        self.stdout.write("Media files not in DB: %d" % total_orphans)
 
         if options["delete_orphans"]:
-            for name in sorted(existing - known):
-                self.stdout.write(f"Deleting {name}")
-                self._delete_file(storage, name)
+            for storage, orphans in orphans_by_storage.items():
+                if orphans:
+                    self.stdout.write(
+                        f"Deleting {len(orphans)} orphan(s) from {storage.__class__.__name__}"
+                    )
+                    for name in sorted(orphans):
+                        self.stdout.write(f"  {name}")
+                        self._delete_file(storage, name)
         else:
             if options["verbosity"] > 1:
-                self.stdout.write("\n".join(sorted(existing - known)))
+                for storage, orphans in orphans_by_storage.items():
+                    if orphans:
+                        self.stdout.write(f"\n{storage.__class__.__name__}:")
+                        self.stdout.write("\n".join(sorted(orphans)))
